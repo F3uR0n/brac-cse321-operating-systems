@@ -1,0 +1,116 @@
+diff --git a/Makefile b/Makefile
+index dde08b1..b878996 100644
+--- a/Makefile
++++ b/Makefile
+@@ -143,6 +143,7 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_sleepms
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -164,7 +165,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 122d9ca..dc121cf 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -183,3 +183,6 @@ void            virtio_disk_intr(void);
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
++
++// MS_PER_TICK
++#define MS_PER_TICK 100
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 076d965..d0e34a1 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_sleepms(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +127,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sleepms] sys_sleepms,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 3dd926d..943c1de 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sleepms 22
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 419e727..8cfd724 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -107,3 +107,28 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_sleepms(void)
++{
++  int ms;
++  argint(0, &ms);
++  if (ms < 0)
++    return -1;
++
++  int nticks = (ms + MS_PER_TICK - 1) / MS_PER_TICK;
++  struct proc *p = myproc();
++
++  acquire(&tickslock);
++  uint ticks0 = ticks;
++
++  while (ticks - ticks0 < nticks) {
++    if (p->killed) {
++      release(&tickslock);
++      return -1;
++    }   
++    sleep(&ticks, &tickslock);
++  }
++  release(&tickslock);
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index ac84de9..c985a12 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -47,3 +47,6 @@ void printf(const char*, ...) __attribute__ ((format (printf, 1, 2)));
+ // umalloc.c
+ void* malloc(uint);
+ void free(void*);
++
++// sleepms
++int sleepms(int);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..0581d4e 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("sleepms");
