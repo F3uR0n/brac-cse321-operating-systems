@@ -1,0 +1,235 @@
+diff --git a/Makefile b/Makefile
+index dde08b1..bc72b3d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -143,6 +143,7 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_test_priority\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -164,7 +165,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22a5401..8beec0a 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -124,6 +124,8 @@ allocproc(void)
+ found:
+   p->pid = allocpid();
+   p->state = USED;
++  p->priority = 1;
++  p->rounds = 0;
+ 
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+@@ -145,7 +147,6 @@ found:
+   memset(&p->context, 0, sizeof(p->context));
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+-
+   return p;
+ }
+ 
+@@ -227,6 +228,8 @@ userinit(void)
+   p->cwd = namei("/");
+ 
+   p->state = RUNNABLE;
++  p->priority = 1;
++  p->rounds = 0;
+ 
+   release(&p->lock);
+ }
+@@ -300,6 +303,8 @@ kfork(void)
+ 
+   acquire(&np->lock);
+   np->state = RUNNABLE;
++  np->priority = p->priority;
++  np->rounds = 0;
+   release(&np->lock);
+ 
+   return pid;
+@@ -424,7 +429,6 @@ kwait(uint64 addr)
+ void
+ scheduler(void)
+ {
+-  struct proc *p;
+   struct cpu *c = mycpu();
+ 
+   c->proc = 0;
+@@ -437,28 +441,35 @@ scheduler(void)
+     intr_on();
+     intr_off();
+ 
+-    int found = 0;
+-    for(p = proc; p < &proc[NPROC]; p++) {
++    struct proc *bestproc = 0;
++    int bestpriority = 11; // priorities are 0-10
++
++    for(struct proc *p = proc; p < &proc[NPROC]; p++) {
+       acquire(&p->lock);
+-      if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
+-      }
++      if(p->state == RUNNABLE && p->priority < bestpriority) {
++        if (bestproc != 0) {
++          release(&bestproc->lock);
++        }
++        bestpriority = p->priority;
++        bestproc = p;
++      } else {
+       release(&p->lock);
++      }
+     }
+-    if(found == 0) {
+-      // nothing to run; stop running on this core until an interrupt.
++
++    if (bestproc == 0) {
++      // nothing to run
+       asm volatile("wfi");
++      continue;
+     }
++
++    bestproc->rounds++;
++    c->proc = bestproc;
++    bestproc->state = RUNNING;
++    swtch(&c->context, &bestproc->context);
++
++    c->proc = 0;
++    release(&bestproc->lock);
+   }
+ }
+ 
+@@ -684,7 +695,7 @@ procdump(void)
+       state = states[p->state];
+     else
+       state = "???";
+-    printf("%d %s %s", p->pid, state, p->name);
++    printf("%d %s %s %d %d", p->pid, state, p->name, p->priority, p->rounds);
+     printf("\n");
+   }
+ }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..9719931 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -103,5 +103,7 @@ struct proc {
+   struct context context;      // swtch() here to run process
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+-  char name[16];               // Process name (debugging)
++  char name[16];               // Process name (debugging
++  int priority;
++  int rounds;
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 076d965..78bb63d 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_setpriority(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +127,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_setpriority] sys_setpriority,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 3dd926d..3a537f6 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_setpriority 22
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 419e727..2b5356f 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -107,3 +107,19 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_setpriority(void)
++{
++  int pr;
++  argint(0, &pr);
++
++  if(pr < 0 || pr > 10)
++    return -1;
++  
++  struct proc *p = myproc();
++  acquire(&p->lock);
++  p->priority = pr;
++  release(&p->lock);
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/test_priority.c b/user/test_priority.c
+new file mode 100644
+index 0000000..a389ba7
+--- /dev/null
++++ b/user/test_priority.c
+@@ -0,0 +1,10 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int main(int argc, char *argv[])
++{
++  int priority = atoi(argv[1]);
++  setpriority(priority);
++  while(1) {}
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index ac84de9..fbb48d6 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -47,3 +47,5 @@ void printf(const char*, ...) __attribute__ ((format (printf, 1, 2)));
+ // umalloc.c
+ void* malloc(uint);
+ void free(void*);
++
++int setpriority(int);
+\ No newline at end of file
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..52627ab 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("setpriority");
