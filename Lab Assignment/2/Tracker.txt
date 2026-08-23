@@ -1,0 +1,100 @@
+Setup
+
+CPU = 1
+
+TASK1:
+
+kernel/proc.h -> struct proc [Added]
+	int tickets;
+	int rounds;
+
+kernel/proc.c -> allocproc [Added]
+	p->rounds = 0;
+kernel/proc.c -> userinit [Added]
+	p->tickets = 10;
+
+kernel/proc.c -> kfork [Added]
+	np->tickets = p->tickets;
+
+TASK2:
+
+user/user.h
+user/usys.pl
+kernel/syscall.h
+kernel/syscall.c
+kernel/sysproc.c
+
+TASK3:
+
+kernel/proc.c ->
+
+static uint32 rand_state = 1;
+
+uint32
+rand(void)
+{
+  rand_state = rand_state * 1103515245 + 12345;
+  return (rand_state >> 16) & 0x7FFF;
+}
+
+TASK4:
+
+kernel/proc.c ->
+
+void
+scheduler(void)
+{
+  struct proc *p;
+  struct cpu *c = mycpu();
+
+  c->proc = 0;
+
+  for (;;) {
+    intr_on();
+    intr_off();
+
+    int total_tickets = 0;
+
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+
+      if (p->state == RUNNABLE)
+        total_tickets += p->tickets;
+
+      release(&p->lock);
+    }
+
+    if (total_tickets == 0) {
+      asm volatile("wfi");
+      continue;
+    }
+
+    int winning_ticket = rand() % total_tickets;
+    int count = 0;
+
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+
+      if (p->state == RUNNABLE) {
+        count += p->tickets;
+
+        if (winning_ticket < count) {
+          p->state = RUNNING;
+          c->proc = p;
+          p->rounds++;
+
+          swtch(&c->context, &p->context);
+
+          mycpu()->intena = 0;
+          c->proc = 0;
+
+          release(&p->lock);
+          break;
+        }
+      }
+
+      release(&p->lock);
+    }
+  }
+}
+
